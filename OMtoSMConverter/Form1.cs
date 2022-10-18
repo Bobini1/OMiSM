@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using IntervalTree;
 
 /* A quick description of the algorithm
  * 
@@ -363,6 +364,7 @@ namespace OMtoSMConverter
             HeaderData.Add(smSetting.SAMPLELENGTH, "20.000000"); //This is completely arbitrary, try getting length of mp3?
             HeaderData.Add(smSetting.SELECTABLE, "YES");
             HeaderData.Add(smSetting.BPMS, beatmap.rawSMBPMs());
+            HeaderData.Add(smSetting.SCROLLS, beatmap.rawSMSCROLLs());
             HeaderData.Add(smSetting.STOPS, ""); //Because fuck stops
             HeaderData.Add(smSetting.BGCHANGES, "");
             HeaderData.Add(smSetting.KEYSOUNDS, ""); // Eventually...
@@ -467,7 +469,7 @@ namespace OMtoSMConverter
             Directory.CreateDirectory(newFolder);
 
             //Write SM file
-            StreamWriter fileWrite = new StreamWriter(newFolder + "\\" + fileName + ".sm");
+            StreamWriter fileWrite = new StreamWriter(newFolder + "\\" + fileName + ".ssc");
             fileWrite.Write(getWholeFile());
             fileWrite.Close();
 
@@ -508,6 +510,7 @@ namespace OMtoSMConverter
         SAMPLELENGTH,
         SELECTABLE,
         BPMS,
+        SCROLLS,
         STOPS,
         BGCHANGES,
         KEYSOUNDS,
@@ -536,6 +539,8 @@ namespace OMtoSMConverter
         //Stepmania Parts
         public List<smMeasure> smMeasures { get; set; }
         public Dictionary<double,double> smBPMs { get; set; }
+
+        public Dictionary<double,double> smSCROLLs { get; set; }
         public double smStartMS { get; set; }
         public int smDiffInd { get; set; }
         public string smKeyType()
@@ -685,6 +690,7 @@ namespace OMtoSMConverter
             //Lets try making the BPMs along with the notes
             //placeHold.smBPMs = getSMBPMsfromTP(placeHold.oTimingPoints, starttime: realStartMS);
             placeHold.smBPMs = new Dictionary<double, double>();
+            placeHold.smSCROLLs = new Dictionary<double, double>();
             return placeHold;
         }
 
@@ -790,6 +796,57 @@ namespace OMtoSMConverter
                 ToBeAdded.fillMeasurefromOsu(currMeasureHO, currMeasureLNEnds);
                 smMeasures.Add(ToBeAdded);
             }
+            
+            // extra pass to insert SCROLLs
+            // create an interval tree of time to measure number
+                                                        // lol, sorry for this. measure1, time1, bpm1
+            var measureTree = new IntervalTree<double, (double, double, double)>();
+            var beatsPerMeasureSM = 4;
+            var offset = 0.0;
+            var ordered = smBPMs.OrderBy(x => x.Key).ToList();
+            var time = offset;
+            for (int i = 1; i < ordered.Count; i++)
+            {
+                var measuresDiff = ordered[i].Key - ordered[i - 1].Key;
+                time = measuresDiff * beatsPerMeasureSM / ordered[i - 1].Value * 1000 * 60 + offset;
+                measureTree.Add(offset, time, (ordered[i-1].Key, offset, ordered[i - 1].Value));
+                offset = time;
+            }
+            measureTree.Add(time, double.MaxValue, (ordered.Last().Key, time, ordered.Last().Value));
+            
+            // now we can insert SCROLLs
+            foreach (var SV in oTimingPoints.FindAll(p => !p.IsTiming()))
+            {
+                var stuff = measureTree.Query(SV.Time).First();
+                var measure = stuff.Item1;
+                var mytime = stuff.Item2;
+                var bpm = stuff.Item3;
+                var myMeasure = measure + (SV.Time  - smStartMS - mytime) / 1000 / 60 / beatsPerMeasureSM * bpm;
+                var scroll = SVtoSCROLL(SV.MSPerBeat);
+                if (smSCROLLs.ContainsKey(myMeasure))
+                {
+                    smSCROLLs[myMeasure] = Math.Max(smSCROLLs[myMeasure], scroll);
+                }
+                else
+                {
+                    smSCROLLs.Add(myMeasure, scroll);
+                }
+            }
+            
+            // insert 1.0 scroll at timing points
+            foreach (var SV in oTimingPoints.FindAll(p => p.IsTiming()))
+            {
+                var stuff = measureTree.Query(SV.Time).First();
+                var measure = stuff.Item1;
+                var mytime = stuff.Item2;
+                var bpm = stuff.Item3;
+                var myMeasure = measure + (SV.Time - mytime) / 1000 / 60 / beatsPerMeasureSM * bpm;
+                if (!smSCROLLs.ContainsKey(myMeasure))
+                {
+                    smSCROLLs.Add(myMeasure, 1.0);
+                }
+            }
+            
         }
 
         //Copy Hitsounds/Keysounds
@@ -933,6 +990,11 @@ namespace OMtoSMConverter
         {
             return (60000 / MSPB);
         }
+
+        public static double SVtoSCROLL(double SV)
+        {
+            return -100 / SV;
+        }
         public void backup(string dest)
         {
             string old = oMetadata["Version"];
@@ -1045,6 +1107,23 @@ namespace OMtoSMConverter
 
             return rawBPMs;
         }
+
+        public string rawSMSCROLLs()
+        {
+            string rawSCROLLs = "";
+            //this originally involved measurenum * BeatsperMeasure
+            foreach (double beatnum in smSCROLLs.Keys)
+            {
+                if (rawSCROLLs != "") rawSCROLLs += Environment.NewLine + ",";
+                rawSCROLLs += string.Join("", 
+                    (beatnum * BeatsPerMeasure).ToString("0.######"), 
+                    "=", 
+                    smSCROLLs[beatnum].ToString());
+            }
+
+            return rawSCROLLs;
+        }
+
         public string entireOsuFile()
         {
             string file = "osu file format v14";
@@ -1083,7 +1162,6 @@ namespace OMtoSMConverter
             fileWrite.Write(entireOsuFile());
             fileWrite.Close();
         }
-
     }
     public enum osuEventType
     {
